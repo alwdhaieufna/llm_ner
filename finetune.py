@@ -6,6 +6,8 @@ import fire
 import torch
 import transformers
 from datasets import load_dataset
+import copy
+import math
 
 """
 Unused imports:
@@ -22,23 +24,220 @@ from peft import (
 )
 from transformers import LlamaForCausalLM, LlamaTokenizer
 
+from transformers import Trainer
+
+from transformers import DataCollatorForSeq2Seq
+
+from datasets import Dataset
+
+
 from utils.prompter import Prompter
+
+origin = [12148,  6597,   278,  7855,   310]
+origin = [str(item) for item in origin]
+
+prefix = [3532, 29966]
+prefix = [str(item) for item in prefix]
+
+suffix = [8653]
+suffix = [str(item) for item in suffix]
+
+input = [29937, 10567, 29901]
+input = [str(item) for item in input]
+
+
+def find_last_index(A, B):
+  B = B[:]
+  for i, x in reversed(list(enumerate(A))):
+    if x == B[-1]:
+      B.pop()
+      if not B:
+        return i
+  return -1
+ 
+
+
+def find_first_index(A, B):
+  B = B[:]
+  for i, x in enumerate(A):
+    if x == B[0]:
+      B.pop(0)
+      if not B:
+        return i
+  return -1
+
+ 
+ 
+def longest_common_sublist(A, B):
+  matrix = [[0 for _ in range(len(B))] for _ in range(len(A))]
+  max_len = 0
+  start_A = -1
+  end_A = -1
+  start_B = -1
+  end_B = -1
+  for i in range(len(A)):
+    for j in range(len(B)):
+      if A[i] == B[j]:
+        if i == 0 or j == 0:
+          matrix[i][j] = 1
+        else:
+          matrix[i][j] = matrix[i-1][j-1] + 1
+        if matrix[i][j] >= max_len:
+          max_len = matrix[i][j]
+          start_A = i - max_len + 1
+          end_A = i
+          start_B = j - max_len + 1
+          end_B = j
+      else:
+        matrix[i][j] = 0
+  return [start_A, end_A, start_B, end_B]
+
+# Create a custom dataset class that inherits from Dataset
+class CustomCTSDataset(Dataset):
+    def __init__(self, dataset):
+        super().__init__(dataset.data)
+        print("-------")
+        print(self.column_names)
+
+class CustomDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
+    def __call__(self, features, return_tensors=None):
+        feat = super().__call__(features, return_tensors=None)
+#        print("feat:")
+#        print(feat)
+        input_ids_batch = feat["input_ids"].tolist()
+        origin_arr = []
+        pos_arr = []
+        neg_arr = []
+        for input_ids in input_ids_batch:
+            input_str = "_".join([str(item) for item in input_ids])
+            origin_str = "_".join(origin)
+            prefix_str = "_".join(prefix)
+            suffix_str = "_".join(suffix)
+            sentence_str = "_".join(input)
+
+            origin_start = input_str.find(origin_str)
+
+            origin_index = input_str[0:origin_start + len(origin_str)].count("_") + 1
+
+            origin_arr.append(origin_index)
+
+            prefix_start = input_str.find(prefix_str)
+            prefix_index = input_str[0:prefix_start + len(prefix_str)].count("_") + 1
+
+            input_start = input_str.find(sentence_str)
+            input_index = input_str[0:input_start + len(sentence_str)].count("_") + 1
+
+
+            suffix_start = input_str.find(suffix_str)
+            suffix_index = input_str[0:suffix_start].count("_") - 1
+
+            entity_ids = input_ids[prefix_index: suffix_index + 1]
+            overlap_ids = longest_common_sublist(input_ids[input_index:prefix_index], entity_ids)
+
+            sentence_list = input_ids[input_index:prefix_index]
+            
+            pos_start = input_index + overlap_ids[0] - overlap_ids[2]
+            pos_end = input_index + overlap_ids[0] - overlap_ids[2] + len(entity_ids)
+            pos_arr.append([pos_start, pos_end - 1])
+            neg_arr.append([pos_start - 1, pos_start - 2, pos_end, pos_end + 1])
+            
+        feat["origin"] = torch.tensor(origin_arr)
+        feat["pos"] = torch.tensor(pos_arr)
+        feat["neg"] = torch.tensor(neg_arr)
+
+        
+        return feat
+
+class ContrastiveTrainer(Trainer):
+    def contrastive_loss(self, hidden_states, origin, pos, neg):
+        # hidden_states:  B * L * D
+        # origin:  B
+        # pos : B * P
+        # neg : B * N
+        # B * 1 * D      pos_e:  B * P * D  neg_e: B * N * D
+        # P = 2  N = 4
+
+        origin_e = torch.gather(hidden_states, 1, origin.unsqueeze(-1).unsqueeze(-1).expand(-1,-1,hidden_states.shape[-1]))
+        pos_e = torch.gather(hidden_states, 1, pos.unsqueeze(-1).expand(-1,-1,hidden_states.shape[-1]))
+        neg_e = torch.gather(hidden_states, 1, neg.unsqueeze(-1).expand(-1,-1,hidden_states.shape[-1]))
+
+        origin_e = origin_e / origin_e.norm(dim=2, keepdim=True)
+        pos_e = pos_e / pos_e.norm(dim=2, keepdim=True)
+        neg_e = neg_e / neg_e.norm(dim=2, keepdim=True)
+
+
+        pos_score = (torch.mul(origin_e, pos_e).sum(dim=2)).sum(dim=1)
+        neg_score = (torch.mul(origin_e, neg_e).sum(dim=2)).sum(dim=1)
+
+        cl_loss = -torch.log(1e-10 + torch.sigmoid(pos_score - neg_score)).mean()
+
+        print("cl_loss:", cl_loss)
+        return cl_loss
+
+
+    def compute_loss(self, model, inputs, return_outputs=False):
+
+        origin = copy.deepcopy(inputs["origin"])
+        pos = copy.deepcopy(inputs["pos"])
+        neg = copy.deepcopy(inputs["neg"])
+
+        if "origin" in inputs:
+            inputs.pop("origin")
+        if "pos" in inputs:
+            inputs.pop("pos")
+        if "neg" in inputs:
+            inputs.pop("neg")
+        
+        if self.label_smoother is not None and "labels" in inputs:
+            labels = inputs.pop("labels")
+        else:
+            labels = None
+        outputs = model(**inputs, output_hidden_states=True)
+
+        cts_loss = self.contrastive_loss(outputs["hidden_states"][26], origin, pos, neg)
+        # Save past state if it exists
+        # TODO: this needs to be fixed and made cleaner later.
+        if self.args.past_index >= 0:
+            self._past = outputs[self.args.past_index]
+
+        if labels is not None:
+            if is_peft_available() and isinstance(model, PeftModel):
+                model_name = unwrap_model(model.base_model)._get_name()
+            else:
+                model_name = unwrap_model(model)._get_name()
+            if model_name in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
+                loss = self.label_smoother(outputs, labels, shift_labels=True)
+            else:
+                loss = self.label_smoother(outputs, labels)
+        else:
+            if isinstance(outputs, dict) and "loss" not in outputs:
+                raise ValueError(
+                    "The model did not return a loss from the inputs, only the following keys: "
+                    f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
+                )
+            # We don't use .loss here since the model may return tuples instead of ModelOutput.
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+        
+        loss += 0.001 * cts_loss
+#        print(0.0015)
+        return (loss, outputs) if return_outputs else loss
+
 
 
 def train(
     # model/data params
     base_model: str = "",  # the only required argument
     data_path: str = "yahma/alpaca-cleaned",
-    output_dir: str = "./lora-alpaca",
+    output_dir: str = "./lora-alpaca_origin",
     # training hyperparams
-    batch_size: int = 128,
-    micro_batch_size: int = 4,
-    num_epochs: int = 3,
+    batch_size: int = 1,
+    micro_batch_size: int = 1,
+    num_epochs: int = 5,
     learning_rate: float = 3e-4,
     cutoff_len: int = 256,
-    val_set_size: int = 2000,
+    val_set_size: int = 10,
     # lora hyperparams
-    lora_r: int = 8,
+    lora_r: int = 32,
     lora_alpha: int = 16,
     lora_dropout: float = 0.05,
     lora_target_modules: List[str] = [
@@ -111,12 +310,14 @@ def train(
 
     model = LlamaForCausalLM.from_pretrained(
         base_model,
-        load_in_8bit=True,
+        load_in_8bit=False,
         torch_dtype=torch.float16,
         device_map=device_map,
     )
 
     tokenizer = LlamaTokenizer.from_pretrained(base_model)
+
+
 
     tokenizer.pad_token_id = (
         0  # unk. we want this to be different from the eos token
@@ -151,6 +352,7 @@ def train(
             data_point["input"],
             data_point["output"],
         )
+
         tokenized_full_prompt = tokenize(full_prompt)
         if not train_on_inputs:
             user_prompt = prompter.generate_prompt(
@@ -169,6 +371,9 @@ def train(
             ] * user_prompt_len + tokenized_full_prompt["labels"][
                 user_prompt_len:
             ]  # could be sped up, probably
+        tokenized_full_prompt["pos"] = [1111,1111]
+        tokenized_full_prompt["neg"] = [0000,0000]
+            
         return tokenized_full_prompt
 
     model = prepare_model_for_int8_training(model)
@@ -210,10 +415,16 @@ def train(
 
     model.print_trainable_parameters()  # Be more transparent about the % of trainable params.
 
+    print("before:")
+
     if val_set_size > 0:
         train_val = data["train"].train_test_split(
             test_size=val_set_size, shuffle=True, seed=42
         )
+        
+#        print(train_val["train"][0])
+#        print(train_val["train"][1])
+        
         train_data = (
             train_val["train"].shuffle().map(generate_and_tokenize_prompt)
         )
@@ -224,12 +435,21 @@ def train(
         train_data = data["train"].shuffle().map(generate_and_tokenize_prompt)
         val_data = None
 
+#    print("after")
+#    print(train_data[0])
+#    print(train_data[1])
+    
+    train_data = CustomCTSDataset(train_data)
+    print("train_data")
+    print(train_data[0])
+    print(train_data[1])
+    
     if not ddp and torch.cuda.device_count() > 1:
         # keeps Trainer from trying its own DataParallelism when more than 1 gpu is available
         model.is_parallelizable = True
         model.model_parallel = True
 
-    trainer = transformers.Trainer(
+    trainer = ContrastiveTrainer(
         model=model,
         train_dataset=train_data,
         eval_dataset=val_data,
@@ -254,18 +474,18 @@ def train(
             report_to="wandb" if use_wandb else None,
             run_name=wandb_run_name if use_wandb else None,
         ),
-        data_collator=transformers.DataCollatorForSeq2Seq(
+        data_collator=CustomDataCollatorForSeq2Seq(
             tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
         ),
     )
     model.config.use_cache = False
 
-    old_state_dict = model.state_dict
-    model.state_dict = (
-        lambda self, *_, **__: get_peft_model_state_dict(
-            self, old_state_dict()
-        )
-    ).__get__(model, type(model))
+#    old_state_dict = model.state_dict
+#    model.state_dict = (
+#        lambda self, *_, **__: get_peft_model_state_dict(
+#            self, old_state_dict()
+#        )
+#    ).__get__(model, type(model))
 
     if torch.__version__ >= "2" and sys.platform != "win32":
         model = torch.compile(model)
